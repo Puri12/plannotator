@@ -30,7 +30,7 @@ plannotator/
 │   │   └── vite.config.ts
 │   └── vscode-extension/         # VS Code extension — opens plans in editor tabs
 │       ├── bin/                   # Router scripts (open-in-vscode, xdg-open)
-│       ├── src/                   # extension.ts, cookie-proxy.ts, ipc-server.ts, panel-manager.ts
+│       ├── src/                   # extension.ts, cookie-proxy.ts, ipc-server.ts, panel-manager.ts, editor-annotations.ts, vscode-theme.ts
 │       └── package.json           # Extension manifest (publisher: backnotprop)
 ├── packages/
 │   ├── server/                   # Shared server implementation
@@ -44,6 +44,7 @@ plannotator/
 │   │   ├── draft.ts              # Annotation draft persistence (~/.plannotator/drafts/)
 │   │   ├── integrations.ts       # Obsidian, Bear integrations
 │   │   ├── ide.ts                # VS Code diff integration (openEditorDiff)
+│   │   ├── editor-annotations.ts  # VS Code editor annotation endpoints
 │   │   └── project.ts            # Project name detection for tags
 │   ├── ui/                       # Shared React components
 │   │   ├── components/           # Viewer, Toolbar, Settings, etc.
@@ -52,6 +53,7 @@ plannotator/
 │   │   ├── utils/                # parser.ts, sharing.ts, storage.ts, planSave.ts, agentSwitch.ts, planDiffEngine.ts
 │   │   ├── hooks/                # useSharing.ts, usePlanDiff.ts, useSidebar.ts, useLinkedDoc.ts, useAnnotationDraft.ts, useCodeAnnotationDraft.ts
 │   │   └── types.ts
+│   ├── shared/                   # Cross-package types (EditorAnnotation)
 │   ├── editor/                   # Plan review App.tsx
 │   └── review-editor/            # Code review UI
 │       ├── App.tsx               # Main review app
@@ -166,6 +168,8 @@ Send Annotations → feedback sent to agent session
 | `/api/plan/vscode-diff` | POST   | Open diff in VS Code (body: baseVersion)   |
 | `/api/doc`              | GET    | Serve linked .md/.mdx file (`?path=<path>`) |
 | `/api/draft`          | GET/POST/DELETE | Auto-save annotation drafts to survive server crashes |
+| `/api/editor-annotations` | GET | List editor annotations (VS Code only) |
+| `/api/editor-annotation` | POST/DELETE | Add or remove an editor annotation (VS Code only) |
 
 ### Review Server (`packages/server/review.ts`)
 
@@ -176,6 +180,8 @@ Send Annotations → feedback sent to agent session
 | `/api/image`          | GET    | Serve image by path query param            |
 | `/api/upload`         | POST   | Upload image, returns `{ path, originalName }` |
 | `/api/draft`          | GET/POST/DELETE | Auto-save annotation drafts to survive server crashes |
+| `/api/editor-annotations` | GET | List editor annotations (VS Code only) |
+| `/api/editor-annotation` | POST/DELETE | Add or remove an editor annotation (VS Code only) |
 
 ### Annotate Server (`packages/server/annotate.ts`)
 
