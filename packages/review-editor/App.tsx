@@ -368,6 +368,8 @@ const ReviewApp: React.FC = () => {
         rawPatch: string;
         gitRef: string;
         diffType: string;
+        diffOptions?: { id: string; label: string }[];
+        error?: string;
       };
 
       const newFiles = parseDiffToFiles(data.rawPatch);
@@ -375,7 +377,13 @@ const ReviewApp: React.FC = () => {
       setDiffType(data.diffType);
       setActiveFileIndex(0);
       setPendingSelection(null);
-      setDiffError((data as { error?: string }).error || null);
+      setDiffError(data.error || null);
+
+      // Update dropdown options on worktree mode transitions
+      if (data.diffOptions) {
+        setGitContext(prev => prev ? { ...prev, diffOptions: data.diffOptions! } : prev);
+      }
+
       // Note: We keep existing annotations - they may still be relevant
       // or user can clear them manually
     } catch (err) {
@@ -837,6 +845,11 @@ const ReviewApp: React.FC = () => {
                           {diffType === 'unstaged' && "No unstaged changes. All changes are staged."}
                           {diffType === 'last-commit' && "No changes in the last commit."}
                           {diffType === 'branch' && `No changes between this branch and ${gitContext?.defaultBranch || 'main'}.`}
+                          {diffType?.startsWith('worktree:') && (
+                            diffType.endsWith(':last-commit') ? "No changes in the last commit in this worktree." :
+                            diffType.endsWith(':branch') ? `No changes vs ${gitContext?.defaultBranch || 'main'} in this worktree.` :
+                            "No uncommitted changes in this worktree."
+                          )}
                         </p>
                       </>
                     )}

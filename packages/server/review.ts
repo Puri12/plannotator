@@ -10,7 +10,7 @@
  */
 
 import { isRemoteSession, getServerPort } from "./remote";
-import { type DiffType, type GitContext, runGitDiff } from "./git";
+import { type DiffType, type GitContext, runGitDiff, getWorktreeDiffOptions } from "./git";
 import { getRepoInfo } from "./repo";
 import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, type OpencodeClient } from "./shared-handlers";
 import { contentHash, deleteDraft } from "./draft";
@@ -141,7 +141,7 @@ export async function startReviewServer(
           if (url.pathname === "/api/diff/switch" && req.method === "POST") {
             try {
               const body = (await req.json()) as { diffType: DiffType };
-              const newDiffType = body.diffType;
+              let newDiffType = body.diffType;
 
               if (!newDiffType) {
                 return Response.json(
@@ -150,8 +150,16 @@ export async function startReviewServer(
                 );
               }
 
-              // Run the new diff
               const defaultBranch = gitContext?.defaultBranch || "main";
+              const previousDiffType = currentDiffType;
+
+              // Handle "back to main repo" sentinel
+              const isBackToMain = newDiffType === ("back-to-main" as DiffType);
+              if (isBackToMain) {
+                newDiffType = "uncommitted" as DiffType;
+              }
+
+              // Run the new diff
               const result = await runGitDiff(newDiffType, defaultBranch);
 
               // Update state
@@ -160,12 +168,27 @@ export async function startReviewServer(
               currentDiffType = newDiffType;
               currentError = result.error;
 
-              return Response.json({
+              // Build response — include diffOptions on worktree mode transitions
+              const response: Record<string, unknown> = {
                 rawPatch: currentPatch,
                 gitRef: currentGitRef,
                 diffType: currentDiffType,
                 ...(currentError && { error: currentError }),
-              });
+              };
+
+              if (isBackToMain) {
+                // Exiting worktree mode: restore original dropdown options
+                response.diffOptions = gitContext?.diffOptions;
+              } else if (
+                newDiffType.startsWith("worktree:") &&
+                !previousDiffType.startsWith("worktree:")
+              ) {
+                // Entering worktree mode: send worktree-scoped dropdown options
+                const wtPath = newDiffType.slice("worktree:".length).replace(/:(?:uncommitted|last-commit|branch)$/, "");
+                response.diffOptions = getWorktreeDiffOptions(wtPath, defaultBranch);
+              }
+
+              return Response.json(response);
             } catch (err) {
               const message =
                 err instanceof Error ? err.message : "Failed to switch diff";

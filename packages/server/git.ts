@@ -12,11 +12,18 @@ export type DiffType =
   | "staged"
   | "unstaged"
   | "last-commit"
-  | "branch";
+  | "branch"
+  | `worktree:${string}`;
 
 export interface DiffOption {
   id: DiffType | "separator";
   label: string;
+}
+
+export interface WorktreeInfo {
+  path: string;
+  branch: string | null; // null = detached HEAD
+  head: string;
 }
 
 export interface GitContext {
@@ -75,6 +82,43 @@ export async function getDefaultBranch(): Promise<string> {
 }
 
 /**
+ * List all git worktrees by parsing `git worktree list --porcelain`
+ */
+export async function getWorktrees(): Promise<WorktreeInfo[]> {
+  try {
+    const result = await $`git worktree list --porcelain`.quiet().nothrow();
+    if (result.exitCode !== 0) return [];
+
+    const text = result.text();
+    const entries: WorktreeInfo[] = [];
+    let current: Partial<WorktreeInfo> = {};
+
+    for (const line of text.split("\n")) {
+      if (line.startsWith("worktree ")) {
+        if (current.path) {
+          entries.push({ path: current.path, head: current.head || "", branch: current.branch ?? null });
+        }
+        current = { path: line.slice("worktree ".length) };
+      } else if (line.startsWith("HEAD ")) {
+        current.head = line.slice("HEAD ".length);
+      } else if (line.startsWith("branch ")) {
+        current.branch = line.slice("branch ".length).replace("refs/heads/", "");
+      } else if (line === "detached") {
+        current.branch = null;
+      }
+    }
+    // Flush last entry
+    if (current.path) {
+      entries.push({ path: current.path, head: current.head || "", branch: current.branch ?? null });
+    }
+
+    return entries;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Get git context including branch info and available diff options
  */
 export async function getGitContext(): Promise<GitContext> {
@@ -93,6 +137,24 @@ export async function getGitContext(): Promise<GitContext> {
     diffOptions.push({ id: "branch", label: `vs ${defaultBranch}` });
   }
 
+  // Discover worktrees and add them as diff options
+  const [worktrees, currentTreePath] = await Promise.all([
+    getWorktrees(),
+    $`git rev-parse --show-toplevel`.quiet().then(r => r.text().trim()).catch(() => null),
+  ]);
+
+  const otherWorktrees = worktrees.filter(wt => wt.path !== currentTreePath);
+
+  if (otherWorktrees.length > 0) {
+    diffOptions.push({ id: "separator", label: "" });
+    for (const wt of otherWorktrees) {
+      const label = wt.branch
+        ? `${wt.branch} (worktree)`
+        : `${wt.path.split("/").pop()} (worktree)`;
+      diffOptions.push({ id: `worktree:${wt.path}`, label });
+    }
+  }
+
   return { currentBranch, defaultBranch, diffOptions };
 }
 
@@ -107,18 +169,20 @@ export async function getGitContext(): Promise<GitContext> {
  * Note: `git diff --no-index` exits with code 1 when files differ (standard git
  * behaviour), so we use `.nothrow()` to avoid treating that as an error.
  */
-async function getUntrackedFileDiffs(srcPrefix = 'a/', dstPrefix = 'b/'): Promise<string> {
+async function getUntrackedFileDiffs(srcPrefix = 'a/', dstPrefix = 'b/', cwd?: string): Promise<string> {
   try {
-    const output = (await $`git ls-files --others --exclude-standard`.quiet()).text();
+    const lsCmd = $`git ls-files --others --exclude-standard`.quiet();
+    const output = (cwd ? await lsCmd.cwd(cwd) : await lsCmd).text();
     const files = output.trim().split('\n').filter((f) => f.length > 0);
     if (files.length === 0) return '';
 
     const diffs = await Promise.all(
       files.map(async (file) => {
         try {
-          const result = await $`git diff --no-index --src-prefix=${srcPrefix} --dst-prefix=${dstPrefix} /dev/null ${file}`
+          const diffCmd = $`git diff --no-index --src-prefix=${srcPrefix} --dst-prefix=${dstPrefix} /dev/null ${file}`
             .quiet()
             .nothrow();
+          const result = cwd ? await diffCmd.cwd(cwd) : await diffCmd;
           return result.text();
         } catch {
           return '';
@@ -132,6 +196,40 @@ async function getUntrackedFileDiffs(srcPrefix = 'a/', dstPrefix = 'b/'): Promis
 }
 
 /**
+ * Parse a worktree diff type like `worktree:/path:last-commit` into path + sub-type.
+ * Falls back to `uncommitted` if no sub-type suffix (backwards compatible).
+ */
+const WORKTREE_SUB_TYPES = new Set(["uncommitted", "last-commit", "branch"]);
+
+function parseWorktreeDiffType(diffType: string): { path: string; subType: string } | null {
+  if (!diffType.startsWith("worktree:")) return null;
+  const rest = diffType.slice("worktree:".length);
+  const lastColon = rest.lastIndexOf(":");
+  if (lastColon !== -1) {
+    const maybeSub = rest.slice(lastColon + 1);
+    if (WORKTREE_SUB_TYPES.has(maybeSub)) {
+      return { path: rest.slice(0, lastColon), subType: maybeSub };
+    }
+  }
+  return { path: rest, subType: "uncommitted" };
+}
+
+/**
+ * Build diff options for worktree mode: back-to-main, separator, then
+ * standard diff types with the worktree path baked into each id.
+ */
+export function getWorktreeDiffOptions(worktreePath: string, defaultBranch: string): DiffOption[] {
+  const prefix = `worktree:${worktreePath}:`;
+  return [
+    { id: "back-to-main" as DiffType, label: "\u2190 Back to main repo" },
+    { id: "separator", label: "" },
+    { id: `${prefix}uncommitted` as DiffType, label: "Uncommitted changes" },
+    { id: `${prefix}last-commit` as DiffType, label: "Last commit" },
+    { id: `${prefix}branch` as DiffType, label: `vs ${defaultBranch}` },
+  ];
+}
+
+/**
  * Run git diff with the specified type
  */
 export async function runGitDiff(
@@ -140,6 +238,60 @@ export async function runGitDiff(
 ): Promise<DiffResult> {
   let patch: string;
   let label: string;
+
+  // Handle worktree diffs — run git commands in the worktree's directory
+  if (diffType.startsWith("worktree:")) {
+    const parsed = parseWorktreeDiffType(diffType);
+    if (!parsed) {
+      return { patch: "", label: "Worktree error", error: "Could not parse worktree diff type" };
+    }
+
+    const { path: wtPath, subType } = parsed;
+
+    try {
+      switch (subType) {
+        case "uncommitted": {
+          const trackedDiff = (await $`git diff HEAD --src-prefix=a/ --dst-prefix=b/`.quiet().cwd(wtPath)).text();
+          const untrackedDiff = await getUntrackedFileDiffs('a/', 'b/', wtPath);
+          patch = trackedDiff + untrackedDiff;
+          label = "Uncommitted changes";
+          break;
+        }
+        case "last-commit": {
+          const hasParent = (await $`git rev-parse --verify HEAD~1`.quiet().nothrow().cwd(wtPath)).exitCode === 0;
+          if (hasParent) {
+            patch = (await $`git diff HEAD~1..HEAD --src-prefix=a/ --dst-prefix=b/`.quiet().cwd(wtPath)).text();
+          } else {
+            // Initial commit — show full tree as diff
+            patch = (await $`git diff --root HEAD --src-prefix=a/ --dst-prefix=b/`.quiet().cwd(wtPath)).text();
+          }
+          label = "Last commit";
+          break;
+        }
+        case "branch":
+          patch = (await $`git diff ${defaultBranch}..HEAD --src-prefix=a/ --dst-prefix=b/`.quiet().cwd(wtPath)).text();
+          label = `Changes vs ${defaultBranch}`;
+          break;
+        default:
+          patch = "";
+          label = "Unknown worktree diff type";
+      }
+
+      // Prefix label with worktree branch name for context
+      try {
+        const branch = (await $`git rev-parse --abbrev-ref HEAD`.quiet().cwd(wtPath)).text().trim();
+        label = `${branch}: ${label}`;
+      } catch {
+        label = `${wtPath.split("/").pop()}: ${label}`;
+      }
+
+      return { patch, label };
+    } catch (error) {
+      console.error(`Git diff error for ${diffType}:`, error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return { patch: "", label: "Worktree error", error: errorMessage };
+    }
+  }
 
   try {
     switch (diffType) {
@@ -166,10 +318,16 @@ export async function runGitDiff(
         break;
       }
 
-      case "last-commit":
-        patch = (await $`git diff HEAD~1..HEAD --src-prefix=a/ --dst-prefix=b/`.quiet()).text();
+      case "last-commit": {
+        const hasParent = (await $`git rev-parse --verify HEAD~1`.quiet().nothrow()).exitCode === 0;
+        if (hasParent) {
+          patch = (await $`git diff HEAD~1..HEAD --src-prefix=a/ --dst-prefix=b/`.quiet()).text();
+        } else {
+          patch = (await $`git diff --root HEAD --src-prefix=a/ --dst-prefix=b/`.quiet()).text();
+        }
         label = "Last commit";
         break;
+      }
 
       case "branch":
         patch = (await $`git diff ${defaultBranch}..HEAD --src-prefix=a/ --dst-prefix=b/`.quiet()).text();
