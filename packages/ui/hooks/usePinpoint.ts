@@ -84,10 +84,16 @@ export function usePinpoint({
   // Click — create Range and trigger web-highlighter
   useEffect(() => {
     const container = containerRef.current;
-    const highlighter = highlighterRef.current;
-    if (!isActive || !container || !highlighter) return;
+    if (!isActive || !container) return;
 
     const handleClick = (e: MouseEvent) => {
+      // Read highlighter at click time, not effect setup time.
+      // On remount (e.g. after exiting plan diff), the highlighter init effect
+      // may not have run yet when this effect sets up, but it will be ready by
+      // the time the user clicks.
+      const highlighter = highlighterRef.current;
+      if (!highlighter) return;
+
       const target = e.target as HTMLElement;
       const resolved = resolvePinpointTarget(target, container, { clientX: e.clientX, clientY: e.clientY });
       if (!resolved) return;
