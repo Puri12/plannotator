@@ -6,8 +6,7 @@
 
 Interactive Plan & Code Review for AI Coding Agents. Mark up and refine your plans or code diffs using a visual UI, share for team collaboration, and seamlessly integrate with **Claude Code**, **OpenCode**, **Pi**, and **Codex**.
 
-**New:** [Code Review](https://x.com/backnotprop/status/2031145299738263567?s=20)
-
+**Plan Mode Demos:**
 <table>
 <tr>
 <td align="center" width="50%">
@@ -26,6 +25,8 @@ Interactive Plan & Code Review for AI Coding Agents. Mark up and refine your pla
 </td>
 </tr>
 </table>
+
+**New:** [Code Review](https://x.com/backnotprop/status/2031145299738263567?s=20)
 
 
 ### Features
