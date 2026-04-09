@@ -20,6 +20,23 @@
 import { type Plugin, tool } from "@opencode-ai/plugin";
 import { existsSync, readFileSync } from "fs";
 import path from "path";
+
+// OpenCode's @hono/node-server patches global.Response with a polyfill that
+// Bun.serve() doesn't accept (it checks native type tags, not instanceof).
+// This happens in "opencode web" and "opencode serve" modes, where
+// createAdaptorServer() runs before plugins load. Recover the native Response
+// from the polyfill's prototype chain — hono sets up:
+//   Object.setPrototypeOf(Response2.prototype, GlobalResponse.prototype)
+// so the parent prototype's constructor IS the original native Response.
+const _proto = Object.getPrototypeOf(Response.prototype);
+if (_proto?.constructor && _proto.constructor !== Response && _proto.constructor !== Object) {
+  globalThis.Response = _proto.constructor;
+  // Also fix Request — hono patches both with the same pattern
+  const _reqProto = Object.getPrototypeOf(Request.prototype);
+  if (_reqProto?.constructor && _reqProto.constructor !== Request && _reqProto.constructor !== Object) {
+    globalThis.Request = _reqProto.constructor;
+  }
+}
 import {
   startPlannotatorServer,
   handleServerReady,
