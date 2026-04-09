@@ -660,6 +660,14 @@ export async function startReviewServer(
             headers: { "Content-Type": "text/html" },
           });
         },
+
+        error(err) {
+          console.error("[plannotator] Server error:", err);
+          return new Response(
+            `Internal Server Error: ${err instanceof Error ? err.message : String(err)}`,
+            { status: 500, headers: { "Content-Type": "text/plain" } },
+          );
+        },
       });
 
       break; // Success, exit retry loop
