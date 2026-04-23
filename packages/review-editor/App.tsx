@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { type Origin, getAgentName } from '@plannotator/shared/agents';
 import { ThemeProvider, useTheme } from '@plannotator/ui/components/ThemeProvider';
+import { TooltipProvider } from '@plannotator/ui/components/Tooltip';
 import { ConfirmDialog } from '@plannotator/ui/components/ConfirmDialog';
 import { Settings } from '@plannotator/ui/components/Settings';
 import { FeedbackButton, ApproveButton, ExitButton } from '@plannotator/ui/components/ToolbarButtons';
@@ -158,6 +159,17 @@ const ReviewApp: React.FC = () => {
   const [isWSL, setIsWSL] = useState(false);
   const [diffType, setDiffType] = useState<string>('uncommitted');
   const [gitContext, setGitContext] = useState<GitContext | null>(null);
+  // Two bases:
+  //   selectedBase  — what the picker is currently showing (UI intent).
+  //                   Updates immediately when the user picks, so the chip
+  //                   feels responsive.
+  //   committedBase — the base the server last computed the patch against.
+  //                   Drives file-content fetches. Only updates after
+  //                   /api/diff/switch returns, so we never pair an old
+  //                   patch with a new base's file contents (race that
+  //                   produced "trailing context mismatch" warnings).
+  const [selectedBase, setSelectedBase] = useState<string | null>(null);
+  const [committedBase, setCommittedBase] = useState<string | null>(null);
   const [agentCwd, setAgentCwd] = useState<string | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -666,6 +678,7 @@ const ReviewApp: React.FC = () => {
         gitRef: string;
         origin?: Origin;
         diffType?: string;
+        base?: string;
         gitContext?: GitContext;
         agentCwd?: string;
         sharingEnabled?: boolean;
@@ -694,7 +707,15 @@ const ReviewApp: React.FC = () => {
         setFiles(apiFiles);
         if (data.origin) setOrigin(data.origin);
         if (data.diffType) setDiffType(data.diffType);
-        if (data.gitContext) setGitContext(data.gitContext);
+        if (data.gitContext) {
+          setGitContext(data.gitContext);
+          // Prefer the server's active base (survives page refresh / reconnect)
+          // over the detected default, so the picker rehydrates to what the
+          // server is actually using.
+          const initial = data.base || data.gitContext.defaultBranch || null;
+          setSelectedBase(initial);
+          setCommittedBase(initial);
+        }
         if (data.agentCwd) setAgentCwd(data.agentCwd);
         if (data.sharingEnabled !== undefined) setSharingEnabled(data.sharingEnabled);
         if (data.repoInfo) setRepoInfo(data.repoInfo);
@@ -904,7 +925,7 @@ const ReviewApp: React.FC = () => {
       const lastColon = rest.lastIndexOf(':');
       if (lastColon !== -1) {
         const sub = rest.slice(lastColon + 1);
-        if (['uncommitted', 'staged', 'unstaged', 'last-commit', 'branch'].includes(sub)) {
+        if (['uncommitted', 'staged', 'unstaged', 'last-commit', 'branch', 'merge-base'].includes(sub)) {
           return { activeWorktreePath: rest.slice(0, lastColon), activeDiffBase: sub };
         }
       }
@@ -925,14 +946,21 @@ const ReviewApp: React.FC = () => {
   // Staging is never available in PR review mode — the server rejects it and the UI shouldn't offer it.
   const canStageFiles = canStageRaw && !prMetadata;
 
-  // Shared helper: fetch a diff switch and update state
-  const fetchDiffSwitch = useCallback(async (fullDiffType: string) => {
+  // Shared helper: fetch a diff switch and update state.
+  // Returns true on success, false on failure — callers that optimistically
+  // updated UI state (e.g. the base picker) can use this to revert.
+  const fetchDiffSwitch = useCallback(async (fullDiffType: string, baseOverride?: string): Promise<boolean> => {
     setIsLoadingDiff(true);
     try {
       const res = await fetch('/api/diff/switch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ diffType: fullDiffType }),
+        body: JSON.stringify({
+          diffType: fullDiffType,
+          // Server ignores base for modes that don't use it (uncommitted/staged/etc),
+          // so forwarding unconditionally is safe and keeps the request shape uniform.
+          ...((baseOverride ?? selectedBase) && { base: baseOverride ?? selectedBase }),
+        }),
       });
 
       if (!res.ok) throw new Error('Failed to switch diff');
@@ -941,6 +969,8 @@ const ReviewApp: React.FC = () => {
         rawPatch: string;
         gitRef: string;
         diffType: string;
+        base?: string;
+        gitContext?: GitContext;
         error?: string;
       };
 
@@ -950,17 +980,67 @@ const ReviewApp: React.FC = () => {
       setDiffData(prev => prev ? { ...prev, rawPatch: data.rawPatch, gitRef: data.gitRef, diffType: data.diffType } : prev);
       setFiles(nextFiles);
       setDiffType(data.diffType);
+      // Adopt the server's echoed base. The server trusts whatever we sent
+      // verbatim — this sync just makes sure selectedBase and committedBase
+      // match the server's view (important when the caller didn't send a
+      // base and the server used the detected default instead).
+      if (data.base) {
+        setSelectedBase(data.base);
+        setCommittedBase(data.base);
+      }
+      // Merge only the per-cwd fields so the sidebar reflects the worktree
+      // we're now in. Keep the original `worktrees` list (already filtered to
+      // exclude the server's startup cwd — replacing it with the new context's
+      // list would duplicate the "Main repo" entry) and `availableBranches`
+      // (shared across worktrees of the same repo).
+      //
+      // IMPORTANT: we deliberately do NOT overwrite `currentBranch`. The
+      // WorktreePicker's top "launch" row uses it as a label, and that row
+      // represents the cwd plannotator was launched in — not whichever
+      // worktree is currently active. Freezing `currentBranch` at its
+      // initial-load value keeps that label truthful. `defaultBranch` and
+      // `diffOptions` update because they describe the active diff, which
+      // other UI (empty-state text, diff-type picker) should see fresh.
+      if (data.gitContext) {
+        setGitContext((prev) => {
+          if (!prev) return data.gitContext!;
+          return {
+            ...prev,
+            defaultBranch: data.gitContext!.defaultBranch,
+            diffOptions: data.gitContext!.diffOptions,
+          };
+        });
+      }
       setActiveFileIndex(0);
       setPendingSelection(null);
       setDiffError(data.error || null);
       resetStagedFiles();
+      return true;
     } catch (err) {
       console.error('Failed to switch diff:', err);
       setDiffError(err instanceof Error ? err.message : 'Failed to switch diff');
+      return false;
     } finally {
       setIsLoadingDiff(false);
     }
-  }, [dockApi, resetStagedFiles]);
+  }, [dockApi, resetStagedFiles, selectedBase]);
+
+  // Switch the base branch the current diff compares against.
+  // Only triggers a refetch when the active mode actually uses a base.
+  // Optimistically updates the picker; reverts if the server-side switch
+  // fails so the chip doesn't lie about what the viewer is actually showing.
+  const handleBaseSelect = useCallback(
+    async (branch: string) => {
+      if (branch === selectedBase) return;
+      const previous = selectedBase;
+      setSelectedBase(branch);
+      if (activeDiffBase === 'branch' || activeDiffBase === 'merge-base') {
+        const ok = await fetchDiffSwitch(diffType, branch);
+        if (!ok) setSelectedBase(previous);
+      }
+    },
+    [selectedBase, activeDiffBase, diffType, fetchDiffSwitch],
+  );
 
   // Switch diff type (uncommitted, last-commit, branch) — composes worktree prefix if active
   const handleDiffSwitch = useCallback(async (baseDiffType: string) => {
@@ -971,14 +1051,17 @@ const ReviewApp: React.FC = () => {
     await fetchDiffSwitch(fullDiffType);
   }, [diffType, activeWorktreePath, fetchDiffSwitch]);
 
-  // Switch worktree context (or back to main repo)
+  // Switch worktree context (or back to main repo). Preserves the current
+  // diff mode across the switch — if the reviewer was looking at "PR Diff"
+  // in the main repo, they should keep looking at "PR Diff" in the target
+  // worktree rather than being silently snapped back to "Uncommitted".
   const handleWorktreeSwitch = useCallback(async (worktreePath: string | null) => {
     if (worktreePath === activeWorktreePath) return;
     const fullDiffType = worktreePath
-      ? `worktree:${worktreePath}:uncommitted`
-      : 'uncommitted';
+      ? `worktree:${worktreePath}:${activeDiffBase}`
+      : activeDiffBase;
     await fetchDiffSwitch(fullDiffType);
-  }, [activeWorktreePath, fetchDiffSwitch]);
+  }, [activeWorktreePath, activeDiffBase, fetchDiffSwitch]);
 
   // Select annotation - switches file if needed and scrolls to it
   const handleSelectAnnotation = useCallback((id: string | null) => {
@@ -1003,6 +1086,26 @@ const ReviewApp: React.FC = () => {
     setSelectedAnnotationId(id);
   }, [allAnnotations, files, handleFileSwitch]);
 
+  // Diff context bundled into local-mode feedback headers so the receiving
+  // agent knows which diff the annotations are anchored to. Uses committedBase
+  // (what the server actually computed) and activeDiffBase/activeWorktreePath
+  // (derived from the committed diffType). Skipped in PR mode — the PR header
+  // already carries the relevant context.
+  // Declared before reviewStateValue because both reviewStateValue and the
+  // feedbackMarkdown memo below read it; moving it below either would put it
+  // in the TDZ when those memos run on first render.
+  const feedbackDiffContext = useMemo(
+    () =>
+      prMetadata || !activeDiffBase
+        ? undefined
+        : {
+            mode: activeDiffBase,
+            base: committedBase ?? undefined,
+            worktreePath: activeWorktreePath,
+          },
+    [prMetadata, activeDiffBase, committedBase, activeWorktreePath],
+  );
+
   // Build ReviewState value for dock panel context
   const reviewStateValue = useMemo<ReviewState>(() => ({
     files,
@@ -1016,6 +1119,17 @@ const ReviewApp: React.FC = () => {
     disableBackground: !diffShowBackground,
     fontFamily: diffFontFamily || undefined,
     fontSize: diffFontSize || undefined,
+    // Only propagate base for modes where it affects old/new content. Avoids
+    // needless file-content re-fetches when switching to uncommitted/staged/etc.
+    // Uses committedBase (not selectedBase) so file-content queries wait for
+    // the new patch to arrive before refetching — otherwise the viewer can
+    // briefly pair an old patch with the new base's content.
+    reviewBase:
+      (activeDiffBase === 'branch' || activeDiffBase === 'merge-base')
+        ? committedBase ?? undefined
+        : undefined,
+    activeDiffBase,
+    feedbackDiffContext,
     allAnnotations,
     externalAnnotations,
     selectedAnnotationId,
@@ -1058,7 +1172,8 @@ const ReviewApp: React.FC = () => {
   }), [
     files, activeFileIndex, diffStyle, diffOverflow, diffIndicators,
     diffLineDiffType, diffShowLineNumbers, diffShowBackground,
-    diffFontFamily, diffFontSize, allAnnotations, externalAnnotations,
+    diffFontFamily, diffFontSize, activeDiffBase, committedBase, feedbackDiffContext,
+    allAnnotations, externalAnnotations,
     selectedAnnotationId, pendingSelection, handleLineSelection,
     handleAddAnnotation, handleAddFileComment, handleEditAnnotation,
     handleSelectAnnotation, handleDeleteAnnotation, viewedFiles,
@@ -1096,7 +1211,7 @@ const ReviewApp: React.FC = () => {
       return;
     }
     try {
-      const feedback = exportReviewFeedback(allAnnotations, prMetadata);
+      const feedback = exportReviewFeedback(allAnnotations, prMetadata, feedbackDiffContext);
       await navigator.clipboard.writeText(feedback);
       setCopyFeedback('Feedback copied!');
       setTimeout(() => setCopyFeedback(null), 2000);
@@ -1105,15 +1220,15 @@ const ReviewApp: React.FC = () => {
       setCopyFeedback('Failed to copy');
       setTimeout(() => setCopyFeedback(null), 2000);
     }
-  }, [allAnnotations, prMetadata]);
+  }, [allAnnotations, prMetadata, feedbackDiffContext]);
 
   const feedbackMarkdown = useMemo(() => {
-    let output = exportReviewFeedback(allAnnotations, prMetadata);
+    let output = exportReviewFeedback(allAnnotations, prMetadata, feedbackDiffContext);
     if (editorAnnotations.length > 0) {
       output += exportEditorAnnotations(editorAnnotations);
     }
     return output;
-  }, [allAnnotations, prMetadata, editorAnnotations]);
+  }, [allAnnotations, prMetadata, feedbackDiffContext, editorAnnotations]);
 
   const totalAnnotationCount = allAnnotations.length + editorAnnotations.length;
 
@@ -1404,6 +1519,7 @@ const ReviewApp: React.FC = () => {
 
   return (
     <ThemeProvider defaultTheme="dark">
+      <TooltipProvider delayDuration={200} skipDelayDuration={100}>
       <ReviewStateProvider value={reviewStateValue}>
       <JobLogsProvider value={jobLogsValue}>
       <div className="h-screen flex flex-col bg-background overflow-hidden">
@@ -1702,6 +1818,10 @@ const ReviewApp: React.FC = () => {
                 activeWorktreePath={activeWorktreePath}
                 onSelectWorktree={handleWorktreeSwitch}
                 currentBranch={gitContext?.currentBranch}
+                availableBranches={prMetadata ? undefined : gitContext?.availableBranches}
+                selectedBase={prMetadata ? undefined : selectedBase ?? undefined}
+                detectedBase={prMetadata ? undefined : gitContext?.defaultBranch}
+                onSelectBase={prMetadata ? undefined : handleBaseSelect}
                 stagedFiles={stagedFiles}
                 onCopyRawDiff={handleCopyDiff}
                 canCopyRawDiff={!!diffData?.rawPatch}
@@ -1777,7 +1897,8 @@ const ReviewApp: React.FC = () => {
                           {activeDiffBase === 'staged' && "No staged changes. Stage some files with git add."}
                           {activeDiffBase === 'unstaged' && "No unstaged changes. All changes are staged."}
                           {activeDiffBase === 'last-commit' && `No changes in the last commit${activeWorktreePath ? ' in this worktree' : ''}.`}
-                          {activeDiffBase === 'branch' && `No changes vs ${gitContext?.defaultBranch || 'main'}${activeWorktreePath ? ' in this worktree' : ''}.`}
+                          {activeDiffBase === 'branch' && `No changes vs ${selectedBase || gitContext?.defaultBranch || 'main'}${activeWorktreePath ? ' in this worktree' : ''}.`}
+                          {activeDiffBase === 'merge-base' && `No changes vs ${selectedBase || gitContext?.defaultBranch || 'main'}${activeWorktreePath ? ' in this worktree' : ''}.`}
                         </p>
                       </>
                     )}
@@ -2078,6 +2199,7 @@ const ReviewApp: React.FC = () => {
 
     </JobLogsProvider>
     </ReviewStateProvider>
+    </TooltipProvider>
     </ThemeProvider>
   );
 };

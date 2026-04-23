@@ -81,6 +81,8 @@ export interface AgentJobHandlerOptions {
     reasoningEffort?: string;
     /** Whether Codex fast mode was enabled. */
     fastMode?: boolean;
+    /** Diff context snapshot at launch (stored on AgentJobInfo for per-job "Copy All"). */
+    diffContext?: AgentJobInfo["diffContext"];
   } | null>;
   /**
    * Called after a job process exits with exit code 0.
@@ -130,7 +132,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
     command: string[],
     label: string,
     outputPath?: string,
-    spawnOptions?: { captureStdout?: boolean; stdinPrompt?: string; cwd?: string; prompt?: string; engine?: string; model?: string; effort?: string; reasoningEffort?: string; fastMode?: boolean },
+    spawnOptions?: { captureStdout?: boolean; stdinPrompt?: string; cwd?: string; prompt?: string; engine?: string; model?: string; effort?: string; reasoningEffort?: string; fastMode?: boolean; diffContext?: AgentJobInfo["diffContext"] },
   ): AgentJobInfo {
     const id = crypto.randomUUID();
     const source = jobSource(id);
@@ -149,6 +151,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
       ...(spawnOptions?.effort && { effort: spawnOptions.effort }),
       ...(spawnOptions?.reasoningEffort && { reasoningEffort: spawnOptions.reasoningEffort }),
       ...(spawnOptions?.fastMode && { fastMode: spawnOptions.fastMode }),
+      ...(spawnOptions?.diffContext && { diffContext: spawnOptions.diffContext }),
     };
 
     let proc: ReturnType<typeof Bun.spawn> | null = null;
@@ -445,6 +448,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
           let jobEffort: string | undefined;
           let jobReasoningEffort: string | undefined;
           let jobFastMode: boolean | undefined;
+          let jobDiffContext: AgentJobInfo["diffContext"] | undefined;
           if (options.buildCommand) {
             // Thread config from POST body to buildCommand
             const config: Record<string, unknown> = {};
@@ -467,6 +471,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
               jobEffort = built.effort;
               jobReasoningEffort = built.reasoningEffort;
               jobFastMode = built.fastMode;
+              jobDiffContext = built.diffContext;
             }
           }
 
@@ -487,6 +492,7 @@ export function createAgentJobHandler(options: AgentJobHandlerOptions): AgentJob
             effort: jobEffort,
             reasoningEffort: jobReasoningEffort,
             fastMode: jobFastMode,
+            diffContext: jobDiffContext,
           });
           return Response.json({ job }, { status: 201 });
         } catch {

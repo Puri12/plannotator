@@ -87,9 +87,21 @@ export const ReviewAgentJobDetailPanel: React.FC<IDockviewPanelProps> = (props) 
     state.onSelectAnnotation(ann.id);
   }, [state.openDiffFile, state.onSelectAnnotation]);
 
+  // Copy All uses the diff context snapshotted on the JOB at launch, not the
+  // current UI state — so if the reviewer switches modes/bases after the job
+  // ran, the exported markdown still describes the diff the agent actually
+  // analyzed. Falls back to current UI state only if the job predates the
+  // snapshotting (older jobs without diffContext).
   const copyAllText = useMemo(
-    () => activeAnnotations.length > 0 ? exportReviewFeedback(activeAnnotations, state.prMetadata) : '',
-    [activeAnnotations, state.prMetadata]
+    () =>
+      activeAnnotations.length > 0
+        ? exportReviewFeedback(
+            activeAnnotations,
+            state.prMetadata,
+            job?.diffContext ?? state.feedbackDiffContext,
+          )
+        : '',
+    [activeAnnotations, state.prMetadata, job?.diffContext, state.feedbackDiffContext],
   );
 
   const { jobLogs } = useJobLogs();

@@ -11,7 +11,10 @@
 
 import { isRemoteSession, getServerHostname, getServerPort } from "./remote";
 import type { Origin } from "@plannotator/shared/agents";
-import { type DiffType, type GitContext, runVcsDiff, getVcsFileContentsForDiff, canStageFiles, stageFile, unstageFile, resolveVcsCwd, validateFilePath } from "./vcs";
+import { type DiffType, type GitContext, runVcsDiff, getVcsFileContentsForDiff, canStageFiles, stageFile, unstageFile, resolveVcsCwd, validateFilePath, getVcsContext } from "./vcs";
+import { parseWorktreeDiffType } from "@plannotator/shared/review-core";
+import type { AgentJobInfo } from "@plannotator/shared/agent-jobs";
+import { resolveBaseBranch } from "@plannotator/shared/review-core";
 import { getRepoInfo } from "./repo";
 import { handleImage, handleUpload, handleAgents, handleServerReady, handleDraftSave, handleDraftLoad, handleDraftDelete, handleFavicon, type OpencodeClient } from "./shared-handlers";
 import { contentHash, deleteDraft } from "./draft";
@@ -62,6 +65,14 @@ export interface ReviewServerOptions {
   diffType?: DiffType;
   /** Git context with branch info and available diff options */
   gitContext?: GitContext;
+  /**
+   * Initial base branch the caller used to compute `rawPatch`. When a caller
+   * overrides the detected default (e.g. Pi's `openCodeReview` accepting a
+   * custom `defaultBranch`), this must be forwarded so the server's internal
+   * `currentBase` state, the `/api/diff` response, and downstream agent
+   * prompts stay consistent with the patch that's already on screen.
+   */
+  initialBase?: string;
   /** Whether URL sharing is enabled (default: true) */
   sharingEnabled?: boolean;
   /** Custom base URL for share links (default: https://share.plannotator.ai) */
@@ -128,6 +139,11 @@ export async function startReviewServer(
   let currentGitRef = options.gitRef;
   let currentDiffType: DiffType = options.diffType || "uncommitted";
   let currentError = options.error;
+  // Tracks the base branch the user picked from the UI. Agent review prompts
+  // read this (not gitContext.defaultBranch) so they analyze the same diff
+  // the reviewer is currently looking at. Honors an explicit initialBase from
+  // the caller — e.g. programmatic Pi callers can request a non-detected base.
+  let currentBase = options.initialBase || gitContext?.defaultBranch || "main";
 
   // Agent jobs — background process manager (late-binds serverUrl via getter)
   let serverUrl = "";
@@ -141,10 +157,25 @@ export async function startReviewServer(
     async buildCommand(provider, config) {
       const cwd = resolveAgentCwd();
       const hasAgentLocalAccess = !!options.agentCwd || !!gitContext;
-      const userMessageOptions = { defaultBranch: gitContext?.defaultBranch, hasLocalAccess: hasAgentLocalAccess };
+      const userMessageOptions = { defaultBranch: currentBase, hasLocalAccess: hasAgentLocalAccess };
+
+      // Snapshot the diff context at launch — stored on the job so
+      // downstream "Copy All" produces the same markdown as /api/feedback
+      // would right now, even if the reviewer switches modes/bases later.
+      // Skipped in PR mode (prMetadata carries equivalent context).
+      const worktreeParts = currentDiffType.startsWith("worktree:")
+        ? parseWorktreeDiffType(currentDiffType)
+        : null;
+      const diffContext: AgentJobInfo["diffContext"] | undefined = prMetadata
+        ? undefined
+        : {
+            mode: (worktreeParts?.subType ?? currentDiffType) as string,
+            base: currentBase,
+            worktreePath: worktreeParts?.path ?? null,
+          };
 
       if (provider === "tour") {
-        return tour.buildCommand({
+        const built = await tour.buildCommand({
           cwd,
           patch: currentPatch,
           diffType: currentDiffType,
@@ -152,6 +183,7 @@ export async function startReviewServer(
           prMetadata,
           config,
         });
+        return built ? { ...built, diffContext } : built;
       }
 
       const userMessage = buildCodexReviewUserMessage(currentPatch, currentDiffType, userMessageOptions, prMetadata);
@@ -163,7 +195,7 @@ export async function startReviewServer(
         const outputPath = generateOutputPath();
         const prompt = CODEX_REVIEW_SYSTEM_PROMPT + "\n\n---\n\n" + userMessage;
         const command = await buildCodexCommand({ cwd, outputPath, prompt, model, reasoningEffort, fastMode });
-        return { command, outputPath, prompt, label: "Code Review", model, reasoningEffort, fastMode: fastMode || undefined };
+        return { command, outputPath, prompt, label: "Code Review", model, reasoningEffort, fastMode: fastMode || undefined, diffContext };
       }
 
       if (provider === "claude") {
@@ -171,7 +203,7 @@ export async function startReviewServer(
         const effort = typeof config?.effort === "string" && config.effort ? config.effort : undefined;
         const prompt = CLAUDE_REVIEW_PROMPT + "\n\n---\n\n" + userMessage;
         const { command, stdinPrompt } = buildClaudeCommand(prompt, model, effort);
-        return { command, stdinPrompt, prompt, cwd, label: "Code Review", captureStdout: true, model, effort };
+        return { command, stdinPrompt, prompt, cwd, label: "Code Review", captureStdout: true, model, effort, diffContext };
       }
 
       return null;
@@ -412,6 +444,10 @@ export async function startReviewServer(
               gitRef: currentGitRef,
               origin,
               diffType: hasLocalAccess ? currentDiffType : undefined,
+              // Echo the active base so a page refresh or reconnect rehydrates
+              // the picker to what the server is actually using — not the
+              // detected default.
+              base: hasLocalAccess ? currentBase : undefined,
               gitContext: hasLocalAccess ? gitContext : undefined,
               sharingEnabled,
               shareBaseUrl,
@@ -434,7 +470,7 @@ export async function startReviewServer(
               );
             }
             try {
-              const body = (await req.json()) as { diffType: DiffType };
+              const body = (await req.json()) as { diffType: DiffType; base?: string };
               let newDiffType = body.diffType;
 
               if (!newDiffType) {
@@ -444,22 +480,49 @@ export async function startReviewServer(
                 );
               }
 
-              const defaultBranch = gitContext?.defaultBranch || "main";
+              const detectedBase = gitContext?.defaultBranch || "main";
+              // Guard against non-string payloads — resolveBaseBranch calls
+              // string methods and would throw a TypeError otherwise. Mirrors
+              // Pi's guard so both runtimes validate identically.
+              const requestedBase = typeof body.base === "string" ? body.base : undefined;
+              const base = resolveBaseBranch(requestedBase, detectedBase);
               const defaultCwd = gitContext?.cwd;
 
               // Run the new diff
-              const result = await runVcsDiff(newDiffType, defaultBranch, defaultCwd);
+              const result = await runVcsDiff(newDiffType, base, defaultCwd);
 
               // Update state
               currentPatch = result.patch;
               currentGitRef = result.label;
               currentDiffType = newDiffType;
+              currentBase = base;
               currentError = result.error;
+
+              // Recompute gitContext for the effective cwd so the client's
+              // sidebar (current branch, default branch, diff-mode options)
+              // reflects the worktree we're now reviewing — not the main
+              // repo's startup state. Best-effort: on failure the client
+              // keeps its existing context.
+              let updatedContext: GitContext | undefined;
+              if (gitContext) {
+                try {
+                  const effectiveCwd = resolveVcsCwd(newDiffType, gitContext.cwd);
+                  updatedContext = await getVcsContext(effectiveCwd);
+                } catch {
+                  /* best-effort */
+                }
+              }
 
               return Response.json({
                 rawPatch: currentPatch,
                 gitRef: currentGitRef,
                 diffType: currentDiffType,
+                // Echo the base the server actually used. resolveBaseBranch
+                // trusts the caller verbatim; this echo lets the client
+                // confirm the request landed (and pick it up when the client
+                // didn't supply one and we fell back to detected default).
+                base: currentBase,
+                ...(updatedContext && { gitContext: updatedContext }),
                 ...(currentError && { error: currentError }),
               });
             } catch (err) {
@@ -505,11 +568,15 @@ export async function startReviewServer(
 
             // Local review: read file contents from local git
             if (hasLocalAccess) {
-              const defaultBranch = gitContext?.defaultBranch || "main";
+              const detectedBase = gitContext?.defaultBranch || "main";
+              const base = resolveBaseBranch(
+                url.searchParams.get("base") ?? undefined,
+                detectedBase,
+              );
               const defaultCwd = gitContext?.cwd;
               const result = await getVcsFileContentsForDiff(
                 currentDiffType,
-                defaultBranch,
+                base,
                 filePath,
                 oldPath,
                 defaultCwd,

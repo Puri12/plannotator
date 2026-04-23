@@ -21,6 +21,7 @@ const CLAUDE_EFFORT: Array<{ value: string; label: string }> = [
 ];
 
 const CODEX_MODELS: Array<{ value: string; label: string }> = [
+  { value: 'gpt-5.5', label: 'GPT-5.5' },
   { value: 'gpt-5.4', label: 'GPT-5.4' },
   { value: 'gpt-5.3-codex', label: 'GPT-5.3 Codex' },
   { value: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
