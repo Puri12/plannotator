@@ -257,8 +257,10 @@ During normal plan review, an Archive sidebar tab provides the same browsing via
 
 | Endpoint              | Method | Purpose                                    |
 | --------------------- | ------ | ------------------------------------------ |
-| `/api/plan`           | GET    | Returns `{ plan, origin, mode: "annotate", filePath, sourceInfo? }` |
+| `/api/plan`           | GET    | Returns `{ plan, origin, mode: "annotate", filePath, sourceInfo?, gate }` |
 | `/api/feedback`       | POST   | Submit annotations (body: feedback, annotations) |
+| `/api/approve`        | POST   | Approve without feedback (review-gate UX, `--gate`) |
+| `/api/exit`           | POST   | Close session without feedback |
 | `/api/image`          | GET    | Serve image by path query param            |
 | `/api/upload`         | POST   | Upload image, returns `{ path, originalName }` |
 | `/api/draft`          | GET/POST/DELETE | Auto-save annotation drafts to survive server crashes |

@@ -24,6 +24,7 @@ import { loadConfig, resolveDefaultDiffType, resolveUseJina } from "@plannotator
 import { resolveMarkdownFile, resolveUserPath, hasMarkdownFiles } from "@plannotator/shared/resolve-file";
 import { FILE_BROWSER_EXCLUDED } from "@plannotator/shared/reference-common";
 import { htmlToMarkdown } from "@plannotator/shared/html-to-markdown";
+import { parseAnnotateArgs } from "@plannotator/shared/annotate-args";
 import { urlToMarkdown } from "@plannotator/shared/url-to-markdown";
 import { statSync } from "fs";
 import path from "path";
@@ -152,15 +153,16 @@ export async function handleAnnotateCommand(
   const { client, htmlContent, getSharingEnabled, getShareBaseUrl, getPasteApiUrl, directory } = deps;
 
   // @ts-ignore - Event properties contain arguments
-  let filePath = event.properties?.arguments || event.arguments || "";
+  const rawArgs = event.properties?.arguments || event.arguments || "";
+  // #570: split --gate / --json out of the args; rest is the file path.
+  // --json is accepted silently (OpenCode writes to session, not stdout).
+  // parseAnnotateArgs strips leading @ on filePath (reference-mode convention).
+  // `rawFilePath` preserves it for the scoped-package markdown fallback.
+  const { filePath, rawFilePath, gate } = parseAnnotateArgs(rawArgs);
 
   if (!filePath) {
-    client.app.log({ level: "error", message: "Usage: /plannotator-annotate <file.md | file.html | https://... | folder/>" });
+    client.app.log({ level: "error", message: "Usage: /plannotator-annotate <file.md | file.html | https://... | folder/> [--gate] [--json]" });
     return;
-  }
-
-  if (filePath.startsWith("@")) {
-    filePath = filePath.slice(1);
   }
 
   let markdown: string;
@@ -206,7 +208,6 @@ export async function handleAnnotateCommand(
       annotateMode = "annotate-folder";
       client.app.log({ level: "info", message: `Opening annotation UI for folder ${resolvedArg}...` });
     } else if (/\.html?$/i.test(resolvedArg)) {
-      // HTML file annotation — convert to markdown via Turndown
       let fileSize: number;
       try {
         fileSize = statSync(resolvedArg).size;
@@ -226,7 +227,11 @@ export async function handleAnnotateCommand(
     } else {
       // Markdown file annotation
       client.app.log({ level: "info", message: `Opening annotation UI for ${filePath}...` });
-      const resolved = await resolveMarkdownFile(filePath, projectRoot);
+      // Strip-first with literal-@ fallback (scoped-package-style names).
+      let resolved = await resolveMarkdownFile(filePath, projectRoot);
+      if (resolved.kind === "not_found" && rawFilePath !== filePath) {
+        resolved = await resolveMarkdownFile(rawFilePath, projectRoot);
+      }
 
       if (resolved.kind === "ambiguous") {
         client.app.log({
@@ -256,6 +261,7 @@ export async function handleAnnotateCommand(
     sharingEnabled: await getSharingEnabled(),
     shareBaseUrl: getShareBaseUrl(),
     pasteApiUrl: getPasteApiUrl(),
+    gate,
     htmlContent,
     onReady: handleAnnotateServerReady,
   });
@@ -264,7 +270,8 @@ export async function handleAnnotateCommand(
   await Bun.sleep(1500);
   server.stop();
 
-  if (result.exit) {
+  // Both exit and approve are "no-op for the agent" — skip session injection.
+  if (result.exit || result.approved) {
     return;
   }
 
@@ -300,6 +307,11 @@ export async function handleAnnotateLastCommand(
   deps: CommandDeps
 ): Promise<string | null> {
   const { client, htmlContent, getSharingEnabled, getShareBaseUrl, getPasteApiUrl } = deps;
+
+  // @ts-ignore - Event properties contain arguments
+  const rawArgs = event.properties?.arguments || event.arguments || "";
+  // #570: support --gate on /plannotator-last (Stop-hook review-gate pattern).
+  const { gate } = parseAnnotateArgs(rawArgs);
 
   // @ts-ignore - Event properties contain sessionID
   const sessionId = event.properties?.sessionID;
@@ -346,6 +358,7 @@ export async function handleAnnotateLastCommand(
     sharingEnabled: await getSharingEnabled(),
     shareBaseUrl: getShareBaseUrl(),
     pasteApiUrl: getPasteApiUrl(),
+    gate,
     htmlContent,
     onReady: handleAnnotateServerReady,
   });
@@ -354,7 +367,8 @@ export async function handleAnnotateLastCommand(
   await Bun.sleep(1500);
   server.stop();
 
-  if (result.exit) {
+  // Both exit and approve signal "don't inject feedback" — return null.
+  if (result.exit || result.approved) {
     return null;
   }
 

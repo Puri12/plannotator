@@ -376,7 +376,9 @@ Do NOT proceed with implementation until your plan is approved.`);
       };
 
       const feedback = await handleAnnotateLastCommand(
-        { properties: { sessionID: input.sessionID } },
+        // input.arguments is the raw tail string from OpenCode's command dispatcher —
+        // needed so --gate / --json reach handleAnnotateLastCommand's parseAnnotateArgs (#570).
+        { properties: { sessionID: input.sessionID, arguments: input.arguments } },
         deps
       );
 

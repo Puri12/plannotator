@@ -55,7 +55,7 @@ export function expandHomePath(input: string, home = homedir()): string {
 	return input;
 }
 
-function stripWrappingQuotes(input: string): string {
+export function stripWrappingQuotes(input: string): string {
 	if (input.length < 2) {
 		return input;
 	}

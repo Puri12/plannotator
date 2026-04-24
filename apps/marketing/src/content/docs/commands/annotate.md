@@ -94,12 +94,56 @@ When annotating an HTML file or URL (not plain markdown), a small badge appears 
 
 The annotation UI in annotate mode works the same as plan review, with a few changes:
 
-- The "Approve" button is hidden (there's nothing to approve)
+- The "Approve" button is hidden by default (there's nothing to approve for most use cases). Pass `--gate` to enable it as a review decision.
 - "Send Feedback" becomes **"Send Annotations"**
 - `Cmd/Ctrl+Enter` sends annotations instead of approving
 - The completion screen says "Annotations Sent" instead of "Plan Approved"
 
 All annotation types work identically: deletions, replacements, comments, insertions, global comments, and image attachments.
+
+## Flags
+
+Three opt-in flags turn annotate into a review gate for hook integrations (spec-driven frameworks, turn-by-turn review, and so on). They compose: use any alone or combine them.
+
+### `--gate`
+
+Adds a third **Approve** button to the UI. The reviewer now has three exits:
+
+- **Approve** — the artifact looks good; the agent should proceed.
+- **Send Annotations** — changes requested; feedback goes back to the agent.
+- **Close** — dismissed without deciding.
+
+### `--json`
+
+Switches stdout to a structured decision object so hooks can route programmatically:
+
+```json
+{ "decision": "approved" | "annotated" | "dismissed", "feedback": "..." }
+```
+
+`feedback` is only present when `decision === "annotated"`.
+
+### `--silent-approve`
+
+Suppresses the plaintext approve marker so Approve emits empty stdout instead of `The user approved.`. Use this with naive hooks that treat any non-empty stdout as a block signal. Approve and Close both become silent, and only Send Annotations blocks with feedback (silence-is-permission).
+
+`--silent-approve` only affects plaintext mode. In `--json` mode, Approve continues to emit `{"decision":"approved"}` — JSON callers route on the `decision` field, so there's no ambiguity to silence.
+
+### Stdout matrix
+
+| Flags | UX | Approve | Close | Send Annotations |
+|---|---|---|---|---|
+| *(none)* | 2-button | n/a | empty | feedback (plaintext) |
+| `--gate` | 3-button | `The user approved.` | empty | feedback (plaintext) |
+| `--gate --silent-approve` | 3-button | empty | empty | feedback (plaintext) |
+| `--json` | 2-button | n/a | `{"decision":"dismissed"}` | `{"decision":"annotated","feedback":"..."}` |
+| `--gate --json` | 3-button | `{"decision":"approved"}` | `{"decision":"dismissed"}` | `{"decision":"annotated","feedback":"..."}` |
+
+**Key property:** `--gate` plaintext output is unambiguous across three decisions — Close is empty, Send Annotations is feedback markdown, Approve is the line `The user approved.`. Drop the marker with `--silent-approve` when your hook treats any stdout as a block. Use `--json` when you want machine-readable decision objects instead of string matching.
+
+On OpenCode and Pi, `--json` and `--silent-approve` are silently accepted because those harnesses write back into the session directly rather than via stdout. The `--gate` flag behaves identically across all three harnesses.
+
+See [Hook integration recipes](/docs/guides/hook-integration/) for ready-to-use PostToolUse and Stop hook examples.
 
 ## Feedback format
 
@@ -128,8 +172,9 @@ The agent receives this and can act on each annotation.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/plan` | GET | Returns `{ plan, mode: "annotate", filePath, sourceInfo }` |
+| `/api/plan` | GET | Returns `{ plan, mode: "annotate", filePath, sourceInfo, gate }` |
 | `/api/feedback` | POST | Submit annotations |
+| `/api/approve` | POST | Approve without feedback (`--gate` UX) |
 | `/api/exit` | POST | Close session without feedback |
 | `/api/image` | GET | Serve image by path |
 | `/api/upload` | POST | Upload image attachment |
